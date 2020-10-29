@@ -371,12 +371,15 @@ def evaluate(args, model, tokenizer, prefix=""):
         all_results = []
         start_time = timeit.default_timer()
         
-        if model_idx == args.ensemble:
+        if args.ensemble and model_idx == args.ensemble:
             all_results = ensemble(args, ALL_RESULTS, ALL_LOGITS, unique_id2example_index, examples)
         else:
             for batch in tqdm(eval_dataloader, desc="Evaluating"):
-                #model.eval()
-                model.train()
+                if args.ensemble:
+                    model.train()
+                else:
+                    model.eval()
+                
                 batch = tuple(t.to(args.device) for t in batch)
 
                 with torch.no_grad():
