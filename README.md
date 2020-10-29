@@ -1,5 +1,13 @@
 # MiuLAB_Confidence
 
+##
+`bash _run.sh`
+要先到 meow2 拿 models/ 和 data/
+
+`--ensemble: 總模型數`
+`--ensemble_top_n: 取最佳 n 個模型`
+
+
 ## SQuAD 分析
 * original
     ![](https://i.imgur.com/G27HM7Y.png)
