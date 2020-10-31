@@ -60,6 +60,12 @@
 * dropout 20/50
     ![](https://i.imgur.com/ne6pbqi.png)
 
+### 小筆資料 (原 cls_diff 絕對值 < 3)
+* original
+    ![](https://i.imgur.com/SnIoOG1.png)
+
+    
+
 
 ![](https://i.imgur.com/JlBiLkD.png)
 ![](https://i.imgur.com/ArNcJZv.png)
