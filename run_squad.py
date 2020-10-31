@@ -268,8 +268,8 @@ def train(args, train_dataset, model, tokenizer):
 
     return global_step, tr_loss / global_step
 
-
-def ensemble(args, all_results, all_logits, unique_id2example_index, examples):
+ensemble_methods = ['sum', 'softmax', 'ratio']
+def ensemble(args, all_results, all_logits, unique_id2example_index, examples, method):
     results = []
     for i in range(len(all_results[0])):
         # calculate softmax of top_n
@@ -284,11 +284,15 @@ def ensemble(args, all_results, all_logits, unique_id2example_index, examples):
         top_indices = np.argsort(logit)[-args.ensemble_top_n:][::-1]
         logit = np.sort(logit)[::-1][:args.ensemble_top_n]
 
-        ## ensemble using ratio of softmax
-        #ratio = np.exp(logit) / sum(np.exp(logit))
-        
-        # ensemble using ratio of logit
-        ratio = logit / sum(logit)
+        if method == 'sum':
+            # ensemble by sum up directly
+            ratio = np.ones(args.ensemble_top_n)
+        elif method == 'softmax':
+            # ensemble using ratio of softmax
+            ratio = np.exp(logit) / sum(np.exp(logit))
+        elif method == 'ratio':
+            # ensemble using ratio of logit
+            ratio = logit / sum(logit)
 
         for j in range(args.ensemble_top_n):
             start_logits += ratio[j] * np.array(all_results[top_indices[j]][i].start_logits)
@@ -299,6 +303,117 @@ def ensemble(args, all_results, all_logits, unique_id2example_index, examples):
     return results
 
 
+def evaluate_from_saved(args, tokenizer, ensemble_method):
+    dataset, examples, features = load_and_cache_examples(args, tokenizer, evaluate=True, output_examples=True)
+
+    if args.test_subset:
+        with open(args.test_subset, 'rb') as F:
+            test_subset = pickle.load(F)
+
+        data_subset = []
+        examples_subset = []
+        features_subset = []
+
+        examples_idx2new = {}
+
+        for i, example in enumerate(examples):
+            if example.qas_id in test_subset:
+                examples_subset.append(example)
+                examples_idx2new[str(i)] = len(examples_subset) - 1
+
+        for i in range(len(features)):
+            if examples[features[i].example_index].qas_id in test_subset:
+                data_subset.append(list(dataset[i]))
+                data_subset[-1][3] = torch.tensor(len(data_subset)-1, dtype=torch.long)
+                features[i].example_index = examples_idx2new[str(features[i].example_index)]
+                features_subset.append(features[i])
+
+        dataset = data_subset
+        examples = examples_subset
+        features = features_subset
+
+    unique_id2example_index = {}
+    for feature in features:
+        unique_id2example_index[feature.unique_id] = feature.example_index
+
+    if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
+        os.makedirs(args.output_dir)
+
+    args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+
+    # Note that DistributedSampler samples randomly
+    eval_sampler = SequentialSampler(dataset)
+    eval_dataloader = DataLoader(dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+
+    # multi-gpu evaluate
+    if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
+        model = torch.nn.DataParallel(model)
+
+    # Eval!
+    #logger.info("***** Running evaluation *****")
+    #logger.info("  Num examples = %d", len(dataset))
+    #logger.info("  Batch size = %d", args.eval_batch_size)
+
+    # Compute predictions
+    output_prediction_file = os.path.join(args.output_dir, "predictions_.json")
+    output_nbest_file = os.path.join(args.output_dir, "nbest_predictions_.json")
+
+    if args.version_2_with_negative:
+        output_null_log_odds_file = os.path.join(args.output_dir, "null_odds_.json")
+    else:
+        output_null_log_odds_file = None
+
+    with open(args.load_saved_results, 'rb') as F:
+        ALL_RESULTS, ALL_LOGITS = pickle.load(F)
+
+    all_results = ensemble(args, ALL_RESULTS, ALL_LOGITS, unique_id2example_index, examples, ensemble_method)
+
+    # XLNet and XLM use a more complex post-processing procedure
+    if args.model_type in ["xlnet", "xlm"]:
+        start_n_top = model.config.start_n_top if hasattr(model, "config") else model.module.config.start_n_top
+        end_n_top = model.config.end_n_top if hasattr(model, "config") else model.module.config.end_n_top
+
+        predictions = compute_predictions_log_probs(
+            examples,
+            features,
+            all_results,
+            args.n_best_size,
+            args.max_answer_length,
+            output_prediction_file,
+            output_nbest_file,
+            output_null_log_odds_file,
+            start_n_top,
+            end_n_top,
+            args.version_2_with_negative,
+            tokenizer,
+            args.verbose_logging,
+        )
+    else:
+        # MODIFIED
+        predictions, logits_json = compute_predictions_logits(
+            examples,
+            features,
+            all_results,
+            args.n_best_size,
+            args.max_answer_length,
+            args.do_lower_case,
+            output_prediction_file,
+            output_nbest_file,
+            output_null_log_odds_file,
+            args.verbose_logging,
+            args.version_2_with_negative,
+            args.null_score_diff_threshold,
+            tokenizer,
+            ensemble=True,
+        )
+
+    # Compute the F1 and exact scores
+    results = squad_evaluate(examples, predictions, logits_json)
+    avg_cls_diff = np.mean([abs(value['cls_diff']) for value in logits_json.values()])
+    
+    return results, avg_cls_diff 
+
+
 def evaluate(args, model, tokenizer, prefix=""):
     dataset, examples, features = load_and_cache_examples(args, tokenizer, evaluate=True, output_examples=True)
 
@@ -306,27 +421,27 @@ def evaluate(args, model, tokenizer, prefix=""):
         with open(args.test_subset, 'rb') as F:
             test_subset = pickle.load(F)
 
-    data_subset = []
-    examples_subset = []
-    features_subset = []
+        data_subset = []
+        examples_subset = []
+        features_subset = []
 
-    examples_idx2new = {}
+        examples_idx2new = {}
 
-    for i, example in enumerate(examples):
-        if example.qas_id in test_subset:
-            examples_subset.append(example)
-            examples_idx2new[str(i)] = len(examples_subset) - 1
+        for i, example in enumerate(examples):
+            if example.qas_id in test_subset:
+                examples_subset.append(example)
+                examples_idx2new[str(i)] = len(examples_subset) - 1
 
-    for i in range(len(features)):
-        if examples[features[i].example_index].qas_id in test_subset:
-            data_subset.append(list(dataset[i]))
-            data_subset[-1][3] = torch.tensor(len(data_subset)-1, dtype=torch.long)
-            features[i].example_index = examples_idx2new[str(features[i].example_index)]
-            features_subset.append(features[i])
+        for i in range(len(features)):
+            if examples[features[i].example_index].qas_id in test_subset:
+                data_subset.append(list(dataset[i]))
+                data_subset[-1][3] = torch.tensor(len(data_subset)-1, dtype=torch.long)
+                features[i].example_index = examples_idx2new[str(features[i].example_index)]
+                features_subset.append(features[i])
 
-    dataset = data_subset
-    examples = examples_subset
-    features = features_subset
+        dataset = data_subset
+        examples = examples_subset
+        features = features_subset
 
     unique_id2example_index = {}
     for feature in features:
@@ -372,7 +487,7 @@ def evaluate(args, model, tokenizer, prefix=""):
         start_time = timeit.default_timer()
         
         if args.ensemble and model_idx == args.ensemble:
-            all_results = ensemble(args, ALL_RESULTS, ALL_LOGITS, unique_id2example_index, examples)
+            all_results = ensemble(args, ALL_RESULTS, ALL_LOGITS, unique_id2example_index, examples, 'ratio')
         else:
             for batch in tqdm(eval_dataloader, desc="Evaluating"):
                 if args.ensemble:
@@ -441,7 +556,6 @@ def evaluate(args, model, tokenizer, prefix=""):
         evalTime = timeit.default_timer() - start_time
         logger.info("  Evaluation done in total %f secs (%f sec per example)", evalTime, evalTime / len(dataset))
 
-
         # XLNet and XLM use a more complex post-processing procedure
         if args.model_type in ["xlnet", "xlm"]:
             start_n_top = model.config.start_n_top if hasattr(model, "config") else model.module.config.start_n_top
@@ -482,6 +596,9 @@ def evaluate(args, model, tokenizer, prefix=""):
             )
             ALL_LOGITS.append(logits_json)
 
+    if args.save_result:
+        with open(args.save_result, 'wb') as F:
+            pickle.dump((ALL_RESULTS[:-1], ALL_LOGITS[:-1]) if args.ensemble else (ALL_RESULTS, ALL_LOGITS), F)
     # Compute the F1 and exact scores.
     results = squad_evaluate(examples, predictions, ALL_LOGITS[-1])
     return results
@@ -749,6 +866,8 @@ def main():
     parser.add_argument("--ensemble", type=int, default=1, help="number of models using dropout ensemble")
     parser.add_argument("--ensemble_top_n", type=int, default=1, help="number of best models using for ensemble")
     parser.add_argument("--test_subset", type=str, default=None, help="subset of low confidence examples")
+    parser.add_argument("--save_result", type=str, default=None, help="path to the file saving results and logits")
+    parser.add_argument("--load_saved_results", type=str, default=None, help="path to load saved results and logits file")
 
     args = parser.parse_args()
 
@@ -893,18 +1012,25 @@ def main():
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
 
         for checkpoint in checkpoints:
-            # Reload the model
-            global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
-            model = AutoModelForQuestionAnswering.from_pretrained(checkpoint)  # , force_download=True)
-            model.to(args.device)
+            if args.load_saved_results:
+                for i in range(len(ensemble_methods)):
+                    result, avg_cls_diff = evaluate_from_saved(args, tokenizer, ensemble_methods[i])
+                    result = dict((k, v) for k, v in result.items())
+                    results.update(result)
+                    logger.info("Ensemble Method: {}\nAverage of CLS_DIFF: {}\nResults: {}".format(ensemble_methods[i], avg_cls_diff, results))
 
-            # Evaluate
-            result = evaluate(args, model, tokenizer, prefix=global_step)
+            else:
+                # Reload the model
+                global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
+                model = AutoModelForQuestionAnswering.from_pretrained(checkpoint)  # , force_download=True)
+                model.to(args.device)
 
-            result = dict((k + ("_{}".format(global_step) if global_step else ""), v) for k, v in result.items())
-            results.update(result)
+                # Evaluate
+                result = evaluate(args, model, tokenizer, prefix=global_step)
 
-    logger.info("Results: {}".format(results))
+                result = dict((k + ("_{}".format(global_step) if global_step else ""), v) for k, v in result.items())
+                results.update(result)
+                logger.info("Results: {}".format(results))
 
     return results
 

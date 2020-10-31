@@ -17,8 +17,10 @@ CUDA_VISIBLE_DEVICES=1 python3 run_squad.py \
   --overwrite_output_dir \
   --save_steps 2000 \
   --eval_all_checkpoints \
-  --ensemble 50 \
-  --ensemble_top_n 20 \
-  --test_subset test_subset.pkl
+  --ensemble 1000 \
+  --ensemble_top_n 5 \
+  --test_subset test_subset_3.pkl \
+  --save_result Results_1000_set3.pkl \
+#  --load_saved_results result_saving_test.pkl
 #--do_train \
 #--model_name_or_path bert-base-uncased \
